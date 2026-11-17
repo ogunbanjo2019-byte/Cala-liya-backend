@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: cala-laiya-email-api
+    runtime: node
+    region: singapore
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM
+        sync: false
+      - key: CONTACT_TO
+        value: reservations@calalaiyabeach-resort.com
+      - key: BOOKING_NOTIFY_TO
+        value: reservations@calalaiyabeach-resort.com
+      - key: CORS_ORIGINS
+        sync: false

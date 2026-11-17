@@ -1,0 +1,12 @@
+{
+  "name": "cala-laiya-email-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cala Laiya Gmail verification and contact API for Render",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
