@@ -1,5 +1,7 @@
 const http = require("node:http");
 const crypto = require("node:crypto");
+const { checkAvailability, reserve } = require("./controllers/booking-controller");
+const bookingStore = require("./models/booking-store");
 
 const port = Number(process.env.PORT || 10000);
 const codes = new Map();
@@ -133,14 +135,6 @@ function bookingFields(data) {
   if (!name || !EMAIL_RE.test(email) || !phone || !bookingReference) return null;
   return { name, email, phone, bookingReference, staySummary };
 }
-function availabilityFields(data) {
-  const room = clean(data.room || data.roomName, 160);
-  const checkIn = clean(data.checkIn, 40);
-  const checkOut = clean(data.checkOut, 40);
-  const guests = clean(data.guests, 40);
-  if (!room || !checkIn || !checkOut) return null;
-  return { room, checkIn, checkOut, guests };
-}
 function paymentMethod(value) {
   const method = clean(value, 40).toLowerCase();
   return method === "card" || method === "bank-transfer" ? method : null;
@@ -154,17 +148,17 @@ const SITE_HTML = String.raw`<!doctype html>
 <style>
 :root{--ink:#20352f;--muted:#66756f;--cream:#f7f3ec;--sand:#c99a62;--line:#e2ddd3;--white:#fff}*{box-sizing:border-box}body{margin:0;background:var(--cream);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{min-height:100vh;display:flex;justify-content:center;padding:48px 20px}.shell{width:min(780px,100%)}.eyebrow{letter-spacing:.22em;color:var(--sand);font-size:11px;font-weight:800}.brand{font-family:Georgia,serif;font-size:clamp(38px,7vw,70px);line-height:1;margin:12px 0 10px}.intro{color:var(--muted);max-width:590px;line-height:1.65}.card{background:var(--white);border:1px solid var(--line);border-radius:24px;padding:clamp(22px,5vw,44px);margin-top:30px;box-shadow:0 20px 60px #30463c12}.steps{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:28px}.step{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:99px;padding:8px 12px}.step.active{background:var(--ink);border-color:var(--ink);color:#fff}h2{font:32px Georgia,serif;margin:0 0 9px}h3{font-size:18px;margin:26px 0 12px}p{line-height:1.55}.notice{padding:16px 18px;border-radius:14px;background:#edf5ef;border:1px solid #cfe3d3;margin:20px 0;color:#2d5c3d}.notice.warn{background:#fff7e8;border-color:#ead5a8;color:#79571e}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.field{display:flex;flex-direction:column;gap:7px;margin-bottom:16px}.field.full{grid-column:1/-1}label{font-size:13px;font-weight:700}input,select{width:100%;border:1px solid #d8d5cf;border-radius:11px;padding:13px 14px;font:inherit;background:#fff;color:var(--ink)}input:focus,select:focus{outline:3px solid #c99a6230;border-color:var(--sand)}button{border:0;border-radius:12px;padding:14px 18px;font:700 14px inherit;cursor:pointer;background:var(--ink);color:#fff}button.secondary{background:#eeeae3;color:var(--ink)}button:disabled{opacity:.55;cursor:not-allowed}.actions{display:flex;gap:12px;justify-content:flex-end;margin-top:10px}.payment{border:1px solid var(--line);border-radius:15px;padding:18px;margin:12px 0;display:flex;gap:14px;align-items:flex-start;cursor:pointer}.payment input{width:auto;margin-top:4px}.payment strong{display:block;margin-bottom:4px}.payment small{color:var(--muted)}.hidden{display:none!important}.summary{background:#faf8f4;border-radius:14px;padding:15px;margin:18px 0;color:var(--muted);font-size:14px}.error{color:#a23e30;margin:12px 0;font-size:14px}.support{color:var(--muted);font-size:13px;margin-top:20px}.support a{color:var(--ink);font-weight:700}@media(max-width:600px){.grid{grid-template-columns:1fr}.field.full{grid-column:auto}.actions{flex-direction:column}.actions button{width:100%}}
 </style></head><body><main><section class="shell"><div class="eyebrow">CALA LAIYA BEACH RESORT</div><div class="brand">Reserve your stay.</div><p class="intro">Choose your room and dates to check availability. Once available, add your guest details, reserve your stay, and complete payment by bank transfer.</p><div class="card"><div class="steps"><span class="step active" data-step="1">1. Room</span><span class="step" data-step="2">2. Guest details</span><span class="step" data-step="3">3. Payment</span></div>
-<section id="roomStep"><h2>Check availability</h2><p class="intro">Select a room option and dates. This will only check availability — it will not send a reservation request.</p><div class="grid"><div class="field full"><label for="room">Room option</label><select id="room"><option value="">Select a room</option><option>Seaview Suite</option><option>Garden Villa</option><option>Beachfront Cottage</option></select></div><div class="field"><label for="checkIn">Check-in</label><input id="checkIn" type="date"></div><div class="field"><label for="checkOut">Check-out</label><input id="checkOut" type="date"></div><div class="field full"><label for="guests">Guests</label><input id="guests" placeholder="e.g. 2 adults" maxlength="40"></div></div><div id="roomError" class="error"></div><div class="actions"><button id="checkBtn">Check availability</button></div><p class="support">Questions? <a href="mailto:reservations@calalaiyabeach-resort.com">Message support</a>.</p></section>
-<section id="guestStep" class="hidden"><h2>Booking is available</h2><div class="notice">Booking is available at the moment. Kindly message support if you have any questions.</div><div id="staySummary" class="summary"></div><h3>Guest details</h3><div class="grid"><div class="field"><label for="name">Full name</label><input id="name" autocomplete="name"></div><div class="field"><label for="phone">Phone number</label><input id="phone" autocomplete="tel"></div><div class="field full"><label for="email">Email address</label><input id="email" type="email" autocomplete="email"></div></div><div id="guestError" class="error"></div><div class="actions"><button class="secondary" id="backRoom">Back</button><button id="reserveBtn">Reserve</button></div></section>
+<section id="roomStep"><h2>Check availability</h2><p class="intro">Select a room option and dates. This will only check availability — it will not send a reservation request.</p><div class="grid"><div class="field full"><label for="room">Room option</label><select id="room"><option value="">Select a room</option><option>Seaview Suite</option><option>Garden Villa</option><option>Beachfront Cottage</option></select></div><div class="field"><label for="checkIn">Check-in</label><input id="checkIn" type="date"></div><div class="field"><label for="checkOut">Check-out</label><input id="checkOut" type="date"></div><div class="field full"><label for="guests">Guests</label><input id="guests" placeholder="e.g. 2 adults" maxlength="40"></div></div><div id="roomError" class="error"></div><div class="actions"><button id="checkBtn">Check availability</button></div><p class="support">Questions? <a href="mailto:reservations@calalaiyabeach-resort.com">Message our support</a>.</p></section>
+<section id="guestStep" class="hidden"><h2>Booking is available</h2><div id="availabilityNotice" class="notice">Room is available for your selected dates. Kindly message our support if you have any questions.</div><div id="staySummary" class="summary"></div><h3>Guest details</h3><div class="grid"><div class="field"><label for="name">Full name</label><input id="name" autocomplete="name"></div><div class="field"><label for="phone">Phone number</label><input id="phone" autocomplete="tel"></div><div class="field full"><label for="email">Email address</label><input id="email" type="email" autocomplete="email"></div></div><label class="field full" style="display:flex;flex-direction:row;align-items:flex-start;gap:10px;font-weight:400"><input id="bookingConsent" type="checkbox" style="width:auto;margin-top:3px"><span>I agree to send my guest and stay details to Cala Laiya so the resort can process this reservation request.</span></label><div id="guestError" class="error"></div><div class="actions"><button class="secondary" id="backRoom">Back</button><button id="reserveBtn">Reserve</button></div></section>
 <section id="paymentStep" class="hidden"><h2>Choose payment method</h2><p class="intro">Your reservation details have been received. Select how you would like to pay.</p><div id="paymentNotice"></div><label class="payment"><input type="radio" name="payment" value="card"><span><strong>Card payment</strong><small>Pay securely by card. Card payment is currently unavailable.</small></span></label><label class="payment"><input type="radio" name="payment" value="bank-transfer"><span><strong>Bank transfer</strong><small>Transfer the amount using the resort bank details, then upload your payment receipt.</small></span></label><div id="bankDetails" class="notice hidden"><strong>Bank transfer</strong><br>Please complete your bank transfer using the resort’s official bank details, then upload your receipt below.</div><div id="receiptBox" class="hidden"><div class="field"><label for="receipt">Payment receipt</label><input id="receipt" type="file" accept="image/jpeg,image/png,image/webp,application/pdf"></div><div id="receiptError" class="error"></div><div class="actions"><button class="secondary" id="backGuest">Back</button><button id="receiptBtn">Upload payment receipt</button></div></div></section>
 <div id="successStep" class="hidden"><h2>Thank you</h2><div class="notice">Payment receipt sent to the resort. Your reservation will be reviewed by support.</div><p class="support">Keep your booking reference for follow-up with the resort.</p></div>
 </div></section></main><script>
 const $=id=>document.getElementById(id), state={};
 function api(path,body){return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(async r=>{const d=await r.json();if(!r.ok)throw Object.assign(new Error(d.error||'Something went wrong.'),{data:d});return d})}
 function setStep(n){document.querySelectorAll('[data-step]').forEach(x=>x.classList.toggle('active',x.dataset.step===String(n)));['roomStep','guestStep','paymentStep','successStep'].forEach(id=>$(id).classList.add('hidden'));$(n===1?'roomStep':n===2?'guestStep':n===3?'paymentStep':'successStep').classList.remove('hidden')}
-$('checkBtn').onclick=()=>{ $('roomError').textContent=''; if(!$('room').value||!$('checkIn').value||!$('checkOut').value){$('roomError').textContent='Select a room and valid dates.';return} api('/api/check-availability',{room:$('room').value,checkIn:$('checkIn').value,checkOut:$('checkOut').value,guests:$('guests').value}).then(d=>{state.stay=d; $('staySummary').textContent=$('room').value+' · '+$('checkIn').value+' to '+$('checkOut').value+($('guests').value?' · '+$('guests').value:'');setStep(2)}).catch(e=>$('roomError').textContent=e.message)};
+$('checkBtn').onclick=()=>{ $('roomError').textContent=''; if(!$('room').value||!$('checkIn').value||!$('checkOut').value){$('roomError').textContent='Select a room and valid dates.';return} api('/api/check-availability',{room:$('room').value,checkIn:$('checkIn').value,checkOut:$('checkOut').value,guests:$('guests').value}).then(d=>{if(!d.available)throw new Error(d.message);state.stay=d; $('availabilityNotice').textContent=d.message; $('staySummary').textContent=$('room').value+' · '+$('checkIn').value+' to '+$('checkOut').value+($('guests').value?' · '+$('guests').value:'');setStep(2)}).catch(e=>$('roomError').textContent=e.message)};
 $('backRoom').onclick=()=>setStep(1); $('backGuest').onclick=()=>setStep(2);
-$('reserveBtn').onclick=()=>{ $('guestError').textContent=''; const body={name:$('name').value,email:$('email').value,phone:$('phone').value,bookingReference:'CL-'+Date.now().toString(36).toUpperCase(),staySummary:$('staySummary').textContent,consent:true}; if(!body.name||!body.email||!body.phone){$('guestError').textContent='Please complete all guest details.';return} state.guest=body; api('/api/booking-notification',body).then(()=>setStep(3)).catch(e=>$('guestError').textContent=e.message)};
+$('reserveBtn').onclick=()=>{ $('guestError').textContent=''; const body={name:$('name').value,email:$('email').value,phone:$('phone').value,bookingReference:'CL-'+Date.now().toString(36).toUpperCase(),room:state.stay?.room,checkIn:state.stay?.checkIn,checkOut:state.stay?.checkOut,guests:state.stay?.guests,consent:$('bookingConsent').checked}; if(!body.name||!body.email||!body.phone||!body.consent){$('guestError').textContent='Complete your guest details and agree to share them with the resort.';return} $('reserveBtn').disabled=true; api('/api/reserve',body).then(d=>{state.guest=Object.assign({},body,{staySummary:$('staySummary').textContent});state.bookingReference=d.bookingReference;$('paymentNotice').innerHTML=d.notificationSent?'':'<div class="notice warn">'+d.message+' Reference: '+d.bookingReference+'</div>';setStep(3)}).catch(e=>$('guestError').textContent=e.message).finally(()=>$('reserveBtn').disabled=false)};
 document.querySelectorAll('input[name="payment"]').forEach(r=>r.onchange=()=>{ $('paymentNotice').innerHTML=''; $('receiptError').textContent=''; api('/api/payment-method',{paymentMethod:r.value}).then(d=>{ $('bankDetails').classList.toggle('hidden',r.value!=='bank-transfer');$('receiptBox').classList.toggle('hidden',r.value!=='bank-transfer')}).catch(e=>{ $('paymentNotice').innerHTML='<div class="notice warn">'+e.message+'</div>'; document.querySelector('input[name="payment"][value="bank-transfer"]').checked=false; $('bankDetails').classList.add('hidden');$('receiptBox').classList.add('hidden')})});
 $('receiptBtn').onclick=()=>{const file=$('receipt').files[0];$('receiptError').textContent='';if(!file){$('receiptError').textContent='Choose your payment receipt first.';return}if(file.size>5*1024*1024){$('receiptError').textContent='Payment receipt must be 5 MB or smaller.';return}const reader=new FileReader();reader.onload=()=>api('/api/payment-proof',Object.assign({},state.guest,{paymentMethod:'bank-transfer',proofConsent:true,fileName:file.name,mimeType:file.type,fileBase64:reader.result.split(',')[1]})).then(()=>setStep(4)).catch(e=>$('receiptError').textContent=e.message);reader.readAsDataURL(file)};
 </script></body></html>`;
@@ -272,21 +266,44 @@ async function api(req, res, pathname) {
   }
 
   if (pathname === "/api/check-availability") {
-    const stay = availabilityFields(data);
-    if (!stay)
-      return json(res, 400, {
-        error: "Select a room and enter valid check-in and check-out dates.",
+    try {
+      const result = await checkAvailability(data);
+      return json(res, result.status, result.body);
+    } catch (error) {
+      return json(res, error.status || 500, { error: error.message || "Could not check room availability." });
+    }
+  }
+
+  if (pathname === "/api/reserve") {
+    try {
+      const result = await reserve(data, {
+        allowNotice: (email) => canSendBookingNotice("booking", req.socket.remoteAddress || "unknown", email),
+        notify: async (record) => {
+          const destination = process.env.BOOKING_NOTIFY_TO || process.env.CONTACT_TO || "reservations@calalaiyabeach-resort.com";
+          const guest = { ...record, staySummary: `${record.room} · ${record.checkIn} to ${record.checkOut}${record.guests ? ` · ${record.guests}` : ""}` };
+          const text = `Reservation submitted\nGuest: ${record.name}\nEmail: ${record.email}\nPhone: ${record.phone}\nRequest reference: ${record.bookingReference}\nRoom: ${record.room}\nCheck-in: ${record.checkIn}\nCheck-out: ${record.checkOut}\nGuests: ${record.guests || "Not specified"}`;
+          await sendEmail({ to: destination, replyTo: record.email, subject: `Reservation submitted — ${record.bookingReference}`, text, html: bookingHtml("Reservation submitted — pending resort review", guest, `<p><b>Room:</b> ${escapeHtml(record.room)}</p><p><b>Check-in:</b> ${escapeHtml(record.checkIn)}</p><p><b>Check-out:</b> ${escapeHtml(record.checkOut)}</p><p><b>Guests:</b> ${escapeHtml(record.guests || "Not specified")}</p>`) });
+        },
       });
-    return json(res, 200, {
-      ok: true,
-      available: true,
-      room: stay.room,
-      checkIn: stay.checkIn,
-      checkOut: stay.checkOut,
-      guests: stay.guests,
-      message: "Booking is available at the moment. Kindly message support if you have any questions.",
-      next: "guest-details",
-    });
+      return json(res, result.status, result.body);
+    } catch (error) {
+      return json(res, error.status || 500, { error: error.message || "Could not save the reservation." });
+    }
+  }
+
+  if (pathname === "/api/admin/reservation-status") {
+    if (!process.env.BOOKING_ADMIN_TOKEN || req.headers["x-admin-token"] !== process.env.BOOKING_ADMIN_TOKEN)
+      return json(res, 401, { error: "Unauthorized." });
+    const reference = clean(data.bookingReference, 100);
+    const status = clean(data.status, 40);
+    if (!reference || !["confirmed", "cancelled"].includes(status))
+      return json(res, 400, { error: "Provide a booking reference and status of confirmed or cancelled." });
+    try {
+      const record = await bookingStore.updateStatus(reference, status);
+      return record ? json(res, 200, { ok: true, bookingReference: reference, status }) : json(res, 404, { error: "Reservation not found." });
+    } catch (error) {
+      return json(res, 500, { error: "Could not update reservation status." });
+    }
   }
 
   if (pathname === "/api/payment-method") {
@@ -310,7 +327,7 @@ async function api(req, res, pathname) {
     });
   }
 
-  if (pathname === "/api/booking-notification" || pathname === "/api/payment-proof") {
+  if (pathname === "/api/payment-proof") {
     const guest = bookingFields(data);
     if (!guest)
       return json(res, 400, {
@@ -320,14 +337,22 @@ async function api(req, res, pathname) {
       pathname === "/api/payment-proof" ? data.proofConsent === true : data.consent === true;
     if (!consentGiven)
       return json(res, 400, { error: "Consent is required before sending these details to the resort." });
-    const kind = pathname === "/api/payment-proof" ? "proof" : "booking";
+    let savedReservation;
+    try {
+      savedReservation = await bookingStore.getReservation(guest.bookingReference);
+    } catch (error) {
+      return json(res, 500, { error: "Could not verify the reservation before processing payment proof." });
+    }
+    if (!savedReservation || savedReservation.email !== guest.email || savedReservation.status === "cancelled")
+      return json(res, 404, { error: "An active reservation matching this guest and booking reference was not found." });
+    const kind = "proof";
     if (!canSendBookingNotice(kind, req.socket.remoteAddress || "unknown", guest.email))
       return json(res, 429, { error: "Please wait before sending another notification." });
     const destination =
       process.env.BOOKING_NOTIFY_TO ||
       process.env.CONTACT_TO ||
       "reservations@calalaiyabeach-resort.com";
-    const isProof = kind === "proof";
+    const isProof = true;
     const selectedPaymentMethod = paymentMethod(data.paymentMethod);
     if (isProof && selectedPaymentMethod === "card")
       return json(res, 409, {
@@ -373,6 +398,8 @@ async function api(req, res, pathname) {
         html: bookingHtml(title, guest, extraHtml),
         attachments,
       });
+      if (!(await bookingStore.markPaymentSubmitted(guest.bookingReference)))
+        return json(res, 404, { error: "Reservation was not found. Please contact the resort with your booking reference." });
       return json(res, 200, {
         ok: true,
         message: isProof
@@ -403,7 +430,7 @@ function applyCors(req, res) {
     res.setHeader("Vary", "Origin");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token");
   res.setHeader("Access-Control-Max-Age", "600");
   return true;
 }
