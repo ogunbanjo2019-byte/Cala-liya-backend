@@ -1,6 +1,7 @@
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { ROOM_CATALOG, roomIdFor } = require("../schemas/booking");
 
 const dataFile = path.resolve(
   process.env.BOOKING_DATA_FILE || path.join(process.cwd(), "data", "reservations.json"),
@@ -18,13 +19,18 @@ function inventory() {
   if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
     throw Object.assign(new Error("Room inventory is not configured correctly."), { status: 503 });
   }
-  const result = {};
-  for (const [room, count] of Object.entries(parsed)) {
-    if (typeof room === "string" && room.trim() && Number.isSafeInteger(count) && count > 0)
-      result[room.trim()] = count;
+  const expectedIds = new Set(ROOM_CATALOG.map((room) => room.id));
+  if (Object.keys(parsed).some((roomId) => !expectedIds.has(roomId))) {
+    throw Object.assign(new Error("Room inventory contains an unknown room ID. Use the IDs from the Cala Laiya frontend catalog."), { status: 503 });
   }
-  if (!Object.keys(result).length)
-    throw Object.assign(new Error("Room inventory is not configured yet. Please contact the resort."), { status: 503 });
+  const result = {};
+  for (const room of ROOM_CATALOG) {
+    const count = parsed[room.id];
+    if (!Number.isSafeInteger(count) || count < 1) {
+      throw Object.assign(new Error(`Room inventory needs a positive unit count for ${room.name} (${room.id}).`), { status: 503 });
+    }
+    result[room.id] = count;
+  }
   return result;
 }
 
@@ -58,12 +64,27 @@ function overlaps(a, b) {
 
 function availabilityFor(records, stay) {
   const inventoryByRoom = inventory();
-  const capacity = inventoryByRoom[stay.room];
-  if (!capacity) return { available: false, room: stay.room, remaining: 0 };
-  const occupied = records.filter(
-    (record) => record.room === stay.room && blockingStatuses.has(record.status) && overlaps(record, stay),
+  const roomId = stay.roomId || roomIdFor(stay.room);
+  const capacity = inventoryByRoom[roomId];
+  if (!capacity)
+    throw Object.assign(new Error(`Inventory is not configured for ${stay.room || roomId}.`), { status: 503 });
+
+  const activeRecords = records.filter((record) => blockingStatuses.has(record.status));
+  const resolvedRecords = activeRecords.map((record) => {
+    const existingRoomId = roomIdFor(record.roomId) || roomIdFor(record.roomName) || roomIdFor(record.room);
+    if (!existingRoomId)
+      throw Object.assign(new Error("An existing reservation uses an unmapped room name. Map legacy reservations before enabling availability checks."), { status: 503 });
+    return { record, roomId: existingRoomId };
+  });
+  const occupied = resolvedRecords.filter(
+    ({ record, roomId: existingRoomId }) => existingRoomId === roomId && overlaps(record, stay),
   ).length;
-  return { available: occupied < capacity, room: stay.room, remaining: Math.max(0, capacity - occupied) };
+  return {
+    available: occupied < capacity,
+    roomId,
+    room: stay.room,
+    remaining: Math.max(0, capacity - occupied),
+  };
 }
 
 async function checkAvailability(stay) {

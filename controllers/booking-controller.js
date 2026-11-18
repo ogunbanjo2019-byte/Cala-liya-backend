@@ -13,7 +13,7 @@ async function checkAvailability(data) {
       ...result,
       ...stay,
       message: result.available
-        ? "Booking is available for your selected dates. Kindly message our support if you have any questions."
+        ? "Available for your selected dates. Kindly message our support if you have any question."
         : "This room is not available for your selected dates. Please choose different dates or message support.",
       next: result.available ? "guest-details" : null,
     },
