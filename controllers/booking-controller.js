@@ -56,3 +56,4 @@ async function reserve(data, { allowNotice, notify }) {
 }
 
 module.exports = { checkAvailability, reserve };
+  

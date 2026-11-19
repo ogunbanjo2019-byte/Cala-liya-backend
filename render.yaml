@@ -12,8 +12,8 @@ services:
       - key: RESEND_FROM
         sync: false
       - key: CONTACT_TO
-        value: reservations@calalaiyabeach-resort.com
+        value: aman@amanpulo.chat
       - key: BOOKING_NOTIFY_TO
-        value: reservations@calalaiyabeach-resort.com
+        value: aman@amanpulo.chat
       - key: CORS_ORIGINS
         value: https://cala-laiya-resort.vercel.app

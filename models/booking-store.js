@@ -148,3 +148,4 @@ async function updateStatus(bookingReference, status) {
 }
 
 module.exports = { checkAvailability, createReservation, getReservation, markPaymentSubmitted, updateStatus };
+  
