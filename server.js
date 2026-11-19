@@ -352,6 +352,16 @@ async function api(req, res, pathname) {
           const guest = { ...record, staySummary: `${record.room} · ${record.checkIn} to ${record.checkOut}${record.guests ? ` · ${record.guests}` : ""}` };
           const text = `Reservation submitted\nGuest: ${record.name}\nEmail: ${record.email}\nPhone: ${record.phone}\nRequest reference: ${record.bookingReference}\nRoom: ${record.room}\nCheck-in: ${record.checkIn}\nCheck-out: ${record.checkOut}\nGuests: ${record.guests || "Not specified"}`;
           await sendEmail({ to: destination, replyTo: record.email, subject: `Reservation submitted — ${record.bookingReference}`, text, html: bookingHtml("Reservation submitted — pending resort review", guest, `<p><b>Room:</b> ${escapeHtml(record.room)}</p><p><b>Check-in:</b> ${escapeHtml(record.checkIn)}</p><p><b>Check-out:</b> ${escapeHtml(record.checkOut)}</p><p><b>Guests:</b> ${escapeHtml(record.guests || "Not specified")}</p>`) });
+          try {
+            await sendEmail({
+              to: record.email,
+              subject: `Cala Laiya booking request received — ${record.bookingReference}`,
+              text: `Your Cala Laiya booking request has been received.\n\nRequest reference: ${record.bookingReference}\nRoom: ${record.room}\nCheck-in: ${record.checkIn}\nCheck-out: ${record.checkOut}\nGuests: ${record.guests || "Not specified"}\n\nThis is a request confirmation, not a final reservation confirmation. The resort will review availability and contact you before payment is finalized.`,
+              html: bookingHtml("Booking request received", guest, `<p>Your request has been sent to the resort for review. Please wait for availability confirmation before transferring money.</p><p><b>Room:</b> ${escapeHtml(record.room)}</p><p><b>Check-in:</b> ${escapeHtml(record.checkIn)}</p><p><b>Check-out:</b> ${escapeHtml(record.checkOut)}</p><p><b>Guests:</b> ${escapeHtml(record.guests || "Not specified")}</p><p><b>Status:</b> Pending resort review</p>`),
+            });
+          } catch (error) {
+            console.error("Guest booking confirmation email failed:", error.message);
+          }
         },
       });
       return json(res, result.status, result.body);
@@ -458,9 +468,25 @@ async function api(req, res, pathname) {
         html: bookingHtml(title, guest, extraHtml),
         attachments,
       });
+      let guestEmailSent = true;
+      try {
+        await sendEmail({
+          to: guest.email,
+          subject: `Cala Laiya payment proof received — ${guest.bookingReference}`,
+          text: `Your payment proof has been received by Cala Laiya.\n\nRequest reference: ${guest.bookingReference}\nRequested stay: ${guest.staySummary}\nPayment method: bank transfer\nReceipt file: ${fileName}\n\nThe resort will verify the transfer and contact you regarding your reservation. This email is confirmation that the proof was received, not final payment or reservation confirmation.`,
+          html: bookingHtml("Payment proof received", guest, `<p>Your payment proof was received and forwarded for resort verification.</p>${extraHtml}<p><b>Status:</b> Awaiting resort verification</p><p>Please keep your original receipt until the resort confirms your stay.</p>`),
+          attachments,
+        });
+      } catch (error) {
+        guestEmailSent = false;
+        console.error("Guest payment receipt email failed:", error.message);
+      }
       return json(res, 200, {
         ok: true,
-        message: `Payment receipt sent to ${PAYMENT_PROOF_RECIPIENT}. Your reservation will be reviewed by support.`,
+        guestEmailSent,
+        message: guestEmailSent
+          ? `Payment receipt sent to ${PAYMENT_PROOF_RECIPIENT} and a copy was emailed to ${guest.email}.`
+          : `Payment receipt sent to ${PAYMENT_PROOF_RECIPIENT}, but the guest copy could not be emailed.`,
       });
     } catch (error) {
       return json(res, 500, { error: error.message || "Could not send the payment receipt email." });

@@ -7,12 +7,22 @@ const dataFile = path.resolve(
   process.env.BOOKING_DATA_FILE || path.join(process.cwd(), "data", "reservations.json"),
 );
 const blockingStatuses = new Set(["pending", "confirmed", "payment-submitted"]);
+const DEFAULT_ROOM_INVENTORY = Object.freeze({
+  "garden-casita": 2,
+  "garden-casita-premier": 2,
+  "two-bedroom-casita": 2,
+  "three-bedroom-casita": 2,
+  "three-bedroom-premier": 2,
+  "luxury-pool-villa-3br": 1,
+  "luxury-pool-villa-4br": 1,
+  "luxury-pool-villa-5br": 1,
+});
 let queue = Promise.resolve();
 
 function inventory() {
   let parsed;
   try {
-    parsed = JSON.parse(process.env.ROOM_INVENTORY_JSON || "{}");
+    parsed = JSON.parse(process.env.ROOM_INVENTORY_JSON || JSON.stringify(DEFAULT_ROOM_INVENTORY));
   } catch {
     throw Object.assign(new Error("Room inventory is not configured correctly."), { status: 503 });
   }
@@ -148,4 +158,3 @@ async function updateStatus(bookingReference, status) {
 }
 
 module.exports = { checkAvailability, createReservation, getReservation, markPaymentSubmitted, updateStatus };
-  
