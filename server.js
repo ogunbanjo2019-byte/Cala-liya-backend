@@ -14,7 +14,7 @@ const MAX_BODY = 32 * 1024;
 const MAX_PROOF_BODY = 7 * 1024 * 1024;
 const MAX_PROOF_BYTES = 5 * 1024 * 1024;
 const MAX_MULTIPART_BODY = MAX_PROOF_BYTES + 128 * 1024;
-const PAYMENT_PROOF_RECIPIENT = "aman@amanpulo.chat";
+const PAYMENT_PROOF_RECIPIENT = process.env.NOTIFY_EMAIL || "aman@amanpulo.chat";
 const ALLOWED_PROOF_TYPES = new Set([
   "image/jpeg",
   "image/png",
@@ -127,42 +127,41 @@ function clean(value, max = 3000) {
     .trim()
     .slice(0, max);
 }
-function resendReady() {
-  return Boolean(process.env.RESEND_API_KEY && process.env.RESEND_FROM);
+function smtpReady() {
+  return Boolean(process.env.SMTP_USER && process.env.SMTP_PASS);
 }
 async function sendEmail({ to, subject, html, text, replyTo, attachments }) {
-  if (!resendReady())
+  if (!smtpReady())
     throw Object.assign(
-      new Error("Email service is not configured yet. Please contact the site administrator."),
+      new Error("Gmail SMTP is not configured yet. Please contact the site administrator."),
       { status: 503 },
     );
-  const payload = {
-    from: process.env.RESEND_FROM,
-    to: Array.isArray(to) ? to : [to],
-    subject,
-    html,
-    text,
-  };
-  if (replyTo) payload.reply_to = replyTo;
-  if (attachments?.length) payload.attachments = attachments;
-  const response = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(12000),
+  const nodemailer = require("nodemailer");
+  const transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
   });
-  if (!response.ok) {
-    const detail = await response.text().catch(() => "");
-    console.error("Resend email send failed:", response.status, detail.slice(0, 500));
+  try {
+    return await transporter.sendMail({
+      from: `Cala Laiya <${process.env.SMTP_USER}>`,
+      to: Array.isArray(to) ? to.join(", ") : to,
+      subject,
+      html,
+      text,
+      ...(replyTo ? { replyTo } : {}),
+      ...(attachments?.length
+        ? { attachments: attachments.map((item) => ({ ...item, content: Buffer.from(item.content, "base64") })) }
+        : {}),
+    });
+  } catch (error) {
+    console.error("Gmail SMTP send failed:", error.response || error.message);
     throw Object.assign(
-      new Error("Email could not be sent. Please try again later or contact the resort."),
+      new Error("Email could not be sent. Check the Gmail SMTP settings and try again."),
       { status: 502 },
     );
+  } finally {
+    transporter.close();
   }
-  return response.json();
 }
 function canSendCode(address, ip) {
   const key = `${ip}:${address}`;
