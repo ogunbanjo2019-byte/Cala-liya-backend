@@ -15,5 +15,7 @@ services:
         value: aman@amanpulo.chat
       - key: BOOKING_NOTIFY_TO
         value: aman@amanpulo.chat
+      - key: ROOM_INVENTORY_JSON
+        value: '{"garden-casita":2,"garden-casita-premier":2,"two-bedroom-casita":2,"three-bedroom-casita":2,"three-bedroom-premier":2,"luxury-pool-villa-3br":1,"luxury-pool-villa-4br":1,"luxury-pool-villa-5br":1}'
       - key: CORS_ORIGINS
         value: https://cala-laiya-resort.vercel.app
