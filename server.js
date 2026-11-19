@@ -13,6 +13,8 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_BODY = 32 * 1024;
 const MAX_PROOF_BODY = 7 * 1024 * 1024;
 const MAX_PROOF_BYTES = 5 * 1024 * 1024;
+const MAX_MULTIPART_BODY = MAX_PROOF_BYTES + 128 * 1024;
+const PAYMENT_PROOF_RECIPIENT = "aman@amanpulo.chat";
 const ALLOWED_PROOF_TYPES = new Set([
   "image/jpeg",
   "image/png",
@@ -28,25 +30,88 @@ function json(res, status, data) {
   });
   res.end(JSON.stringify(data));
 }
-function readJson(req, maxBytes = MAX_BODY) {
+function readRequestBuffer(req, maxBytes) {
   return new Promise((resolve, reject) => {
-    let body = "";
+    const chunks = [];
+    let size = 0;
+    let tooLarge = false;
     req.on("data", (chunk) => {
-      body += chunk;
-      if (Buffer.byteLength(body) > maxBytes) {
-        reject(Object.assign(new Error("Request too large"), { status: 413 }));
-        req.destroy();
+      if (tooLarge) return;
+      size += chunk.length;
+      if (size > maxBytes) {
+        tooLarge = true;
+        chunks.length = 0;
+        return;
       }
+      chunks.push(chunk);
     });
     req.on("end", () => {
-      try {
-        resolve(JSON.parse(body || "{}"));
-      } catch {
-        reject(Object.assign(new Error("Invalid JSON"), { status: 400 }));
-      }
+      if (tooLarge) reject(Object.assign(new Error("Request too large"), { status: 413 }));
+      else resolve(Buffer.concat(chunks, size));
     });
     req.on("error", reject);
   });
+}
+async function readJson(req, maxBytes = MAX_BODY) {
+  const body = await readRequestBuffer(req, maxBytes);
+  try {
+    return JSON.parse(body.toString("utf8") || "{}");
+  } catch {
+    throw Object.assign(new Error("Invalid JSON"), { status: 400 });
+  }
+}
+async function readMultipart(req) {
+  const contentType = String(req.headers["content-type"] || "");
+  const match = /^multipart\/form-data\s*;\s*boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(contentType);
+  const boundary = match?.[1] || match?.[2];
+  if (!boundary || boundary.length > 70)
+    throw Object.assign(new Error("Invalid multipart request"), { status: 400 });
+
+  const body = await readRequestBuffer(req, MAX_MULTIPART_BODY);
+  const delimiter = Buffer.from(`--${boundary}`);
+  const separator = Buffer.from(`\r\n--${boundary}`);
+  const headerEnd = Buffer.from("\r\n\r\n");
+  if (!body.subarray(0, delimiter.length).equals(delimiter))
+    throw Object.assign(new Error("Invalid multipart body"), { status: 400 });
+
+  const fields = {};
+  let paymentProof = null;
+  let cursor = delimiter.length;
+  while (cursor < body.length) {
+    if (body.subarray(cursor, cursor + 2).toString() === "--") break;
+    if (body.subarray(cursor, cursor + 2).toString() !== "\r\n")
+      throw Object.assign(new Error("Invalid multipart body"), { status: 400 });
+    cursor += 2;
+    const endOfHeaders = body.indexOf(headerEnd, cursor);
+    if (endOfHeaders < 0)
+      throw Object.assign(new Error("Invalid multipart headers"), { status: 400 });
+    const headers = body.subarray(cursor, endOfHeaders).toString("latin1");
+    const disposition = /content-disposition:\s*form-data;([^\r\n]+)/i.exec(headers)?.[1] || "";
+    const fieldName = /(?:^|;)\s*name="([^"]+)"/i.exec(disposition)?.[1];
+    if (!fieldName)
+      throw Object.assign(new Error("Invalid multipart field"), { status: 400 });
+    const contentStart = endOfHeaders + headerEnd.length;
+    const nextPart = body.indexOf(separator, contentStart);
+    if (nextPart < 0)
+      throw Object.assign(new Error("Invalid multipart body"), { status: 400 });
+    const content = body.subarray(contentStart, nextPart);
+    const filename = /(?:^|;)\s*filename="([^"]*)"/i.exec(disposition)?.[1];
+    if (fieldName === "paymentProof") {
+      if (paymentProof || !filename)
+        throw Object.assign(new Error("Upload one payment-proof file."), { status: 400 });
+      const mimeType = /(?:^|\r\n)content-type:\s*([^\r\n]+)/i.exec(headers)?.[1]?.trim().toLowerCase() || "";
+      paymentProof = { fileName: filename, mimeType, buffer: content };
+    } else {
+      fields[fieldName] = content.toString("utf8");
+    }
+    cursor = nextPart + 2 + delimiter.length;
+    const suffix = body.subarray(cursor, cursor + 2).toString();
+    if (suffix === "--") break;
+    if (suffix !== "\r\n")
+      throw Object.assign(new Error("Invalid multipart boundary"), { status: 400 });
+  }
+  fields._paymentProof = paymentProof;
+  return fields;
 }
 function escapeHtml(value) {
   return String(value).replace(
@@ -169,10 +234,14 @@ function sendHtml(res, html) {
 async function api(req, res, pathname) {
   if (req.method !== "POST")
     return json(res, 405, { error: "Method not allowed." });
-  const maxBytes = pathname === "/api/payment-proof" ? MAX_PROOF_BODY : MAX_BODY;
+  const isPaymentProof = pathname === "/api/payment-proof";
+  const isMultipartProof = isPaymentProof && /^multipart\/form-data\b/i.test(String(req.headers["content-type"] || ""));
+  const maxBytes = isPaymentProof ? MAX_PROOF_BODY : MAX_BODY;
   let data;
   try {
-    data = await readJson(req, maxBytes);
+    data = isMultipartProof
+      ? await readMultipart(req)
+      : await readJson(req, maxBytes);
   } catch (error) {
     return json(res, error.status || 400, {
       error:
@@ -327,87 +396,74 @@ async function api(req, res, pathname) {
     });
   }
 
-  if (pathname === "/api/payment-proof") {
+  if (isPaymentProof) {
     const guest = bookingFields(data);
-    if (!guest)
+    if (!guest || !clean(data.staySummary, 500))
       return json(res, 400, {
-        error: "Enter a valid guest name, email, phone number, and booking reference.",
+        error: "Enter valid guest details, a booking reference, and the requested stay summary.",
       });
     const consentGiven =
-      pathname === "/api/payment-proof" ? data.proofConsent === true : data.consent === true;
+      data.proofConsent === true || /^(true|yes)$/i.test(String(data.proofConsent || ""));
     if (!consentGiven)
       return json(res, 400, { error: "Consent is required before sending these details to the resort." });
-    let savedReservation;
-    try {
-      savedReservation = await bookingStore.getReservation(guest.bookingReference);
-    } catch (error) {
-      return json(res, 500, { error: "Could not verify the reservation before processing payment proof." });
-    }
-    if (!savedReservation || savedReservation.email !== guest.email || savedReservation.status === "cancelled")
-      return json(res, 404, { error: "An active reservation matching this guest and booking reference was not found." });
-    const kind = "proof";
-    if (!canSendBookingNotice(kind, req.socket.remoteAddress || "unknown", guest.email))
-      return json(res, 429, { error: "Please wait before sending another notification." });
-    const destination =
-      process.env.BOOKING_NOTIFY_TO ||
-      process.env.CONTACT_TO ||
-      "reservations@calalaiyabeach-resort.com";
-    const isProof = true;
     const selectedPaymentMethod = paymentMethod(data.paymentMethod);
-    if (isProof && selectedPaymentMethod === "card")
+    if (selectedPaymentMethod === "card")
       return json(res, 409, {
         error: "Card payment is currently unavailable. Please proceed with bank transfer.",
         fallback: "bank-transfer",
       });
-    if (isProof && selectedPaymentMethod !== "bank-transfer")
+    if (selectedPaymentMethod !== "bank-transfer")
       return json(res, 400, {
         error: "Select bank transfer before uploading your payment receipt.",
       });
-    let attachments;
-    let extraText = "";
-    let extraHtml = "";
-    if (isProof) {
-      const mimeType = clean(data.mimeType, 80).toLowerCase();
-      const fileName = clean(data.fileName, 160).replace(/[^a-zA-Z0-9._-]/g, "_") || "payment-proof";
+    const uploaded = data._paymentProof;
+    const mimeType = clean(uploaded?.mimeType || data.mimeType, 80).toLowerCase();
+    const fileName = clean(uploaded?.fileName || data.fileName, 160).replace(/[^a-zA-Z0-9._-]/g, "_") || "payment-proof";
+    let fileBuffer;
+    if (uploaded?.buffer) {
+      fileBuffer = uploaded.buffer;
+    } else {
       const fileBase64 = clean(data.fileBase64, MAX_PROOF_BODY);
-      if (!ALLOWED_PROOF_TYPES.has(mimeType) || !/^[A-Za-z0-9+/]+={0,2}$/.test(fileBase64))
+      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(fileBase64))
         return json(res, 400, { error: "Upload a JPG, PNG, WebP, or PDF payment proof file." });
-      const fileBuffer = Buffer.from(fileBase64, "base64");
-      if (!fileBuffer.length || fileBuffer.length > MAX_PROOF_BYTES)
-        return json(res, 400, { error: "Payment proof must be a non-empty file of 5 MB or smaller." });
-      const signatureMatches =
-        (mimeType === "application/pdf" && fileBuffer.subarray(0, 5).toString() === "%PDF-") ||
-        (mimeType === "image/png" && fileBuffer.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))) ||
-        (mimeType === "image/jpeg" && fileBuffer[0] === 0xff && fileBuffer[1] === 0xd8 && fileBuffer[2] === 0xff) ||
-        (mimeType === "image/webp" && fileBuffer.subarray(0, 4).toString() === "RIFF" && fileBuffer.subarray(8, 12).toString() === "WEBP");
-      if (!signatureMatches)
-        return json(res, 400, { error: "The uploaded file does not match its selected image or PDF type." });
-      attachments = [{ filename: fileName, content: fileBuffer.toString("base64") }];
-      extraText = `\nPayment method: bank transfer\nPayment proof attached: ${fileName}`;
-      extraHtml = `<p><b>Payment method:</b> bank transfer</p><p><b>Payment proof:</b> attached (${escapeHtml(fileName)})</p>`;
+      fileBuffer = Buffer.from(fileBase64, "base64");
     }
-    const title = isProof ? "Bank transfer payment proof uploaded" : "Reservation submitted";
+    if (!fileBuffer.length)
+      return json(res, 400, { error: "Choose a non-empty payment-proof file." });
+    if (fileBuffer.length > MAX_PROOF_BYTES)
+      return json(res, 413, { error: "Payment proof files must be 5 MB or smaller." });
+    if (!ALLOWED_PROOF_TYPES.has(mimeType))
+      return json(res, 400, { error: "Upload a JPG, PNG, WebP, or PDF payment proof file." });
+    const signatureMatches =
+      (mimeType === "application/pdf" && fileBuffer.subarray(0, 5).toString() === "%PDF-") ||
+      (mimeType === "image/png" && fileBuffer.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))) ||
+      (mimeType === "image/jpeg" && fileBuffer[0] === 0xff && fileBuffer[1] === 0xd8 && fileBuffer[2] === 0xff) ||
+      (mimeType === "image/webp" && fileBuffer.subarray(0, 4).toString() === "RIFF" && fileBuffer.subarray(8, 12).toString() === "WEBP");
+    if (!signatureMatches)
+      return json(res, 400, { error: "The uploaded file does not match its selected image or PDF type." });
+    if (!canSendBookingNotice("proof", req.socket.remoteAddress || "unknown", guest.email))
+      return json(res, 429, { error: "Please wait before sending another notification." });
+    const attachments = [{ filename: fileName, content: fileBuffer.toString("base64") }];
+    const extraText = `\nPayment method: bank transfer\nPayment proof attached: ${fileName}`;
+    const extraHtml = `<p><b>Payment method:</b> bank transfer</p><p><b>Payment proof:</b> attached (${escapeHtml(fileName)})</p>`;
+    const title = "Bank transfer payment proof uploaded";
     const subject = `${title} — ${guest.bookingReference}`;
     const text = `Cala Laiya ${title.toLowerCase()}\nGuest: ${guest.name}\nEmail: ${guest.email}\nPhone: ${guest.phone}\nRequest reference: ${guest.bookingReference}\nRequested stay: ${guest.staySummary}${extraText}`;
     try {
       await sendEmail({
-        to: destination,
+        to: PAYMENT_PROOF_RECIPIENT,
         replyTo: guest.email,
         subject,
         text,
         html: bookingHtml(title, guest, extraHtml),
         attachments,
       });
-      if (!(await bookingStore.markPaymentSubmitted(guest.bookingReference)))
-        return json(res, 404, { error: "Reservation was not found. Please contact the resort with your booking reference." });
       return json(res, 200, {
         ok: true,
-        message: isProof
-          ? "Payment receipt sent to the resort. Your reservation will be reviewed by support."
-          : "Reservation submitted. Choose a payment method to continue.",
+        message: `Payment receipt sent to ${PAYMENT_PROOF_RECIPIENT}. Your reservation will be reviewed by support.`,
       });
     } catch (error) {
-      return json(res, error.status || 502, { error: error.message || "Could not send the notification." });
+      return json(res, 500, { error: error.message || "Could not send the payment receipt email." });
     }
   }
   return json(res, 404, { error: "Not found." });

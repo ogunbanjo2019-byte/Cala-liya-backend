@@ -16,4 +16,4 @@ services:
       - key: BOOKING_NOTIFY_TO
         value: reservations@calalaiyabeach-resort.com
       - key: CORS_ORIGINS
-        sync: false
+        value: https://cala-laiya-resort.vercel.app
