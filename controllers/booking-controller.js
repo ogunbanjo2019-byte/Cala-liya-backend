@@ -33,23 +33,17 @@ async function reserve(data, { allowNotice, notify }) {
   if (result.unavailable)
     return { status: 409, body: { error: "This room is no longer available for your selected dates. Please choose different dates or message support.", available: false } };
 
-  let notificationSent = true;
-  try {
-    await notify(result.reservation);
-  } catch (error) {
-    notificationSent = false;
-    console.error("Reservation notification failed:", error.message);
-  }
+  Promise.resolve()
+    .then(() => notify(result.reservation))
+    .catch((error) => console.error("Reservation notification failed:", error.message));
   return {
     status: 200,
     body: {
       ok: true,
       bookingReference: result.reservation.bookingReference,
       status: result.reservation.status,
-      notificationSent,
-      message: notificationSent
-        ? "Reservation saved. Choose a payment method to continue."
-        : "Your reservation was saved, but the resort notification could not be sent. Please contact support with your booking reference.",
+      notificationPending: true,
+      message: "Reservation saved. Resort email notification is being attempted separately. Continue to payment when ready.",
       next: "payment",
     },
   };

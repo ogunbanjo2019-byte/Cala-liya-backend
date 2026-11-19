@@ -1,5 +1,7 @@
 const http = require("node:http");
 const crypto = require("node:crypto");
+const fs = require("node:fs/promises");
+const path = require("node:path");
 const { checkAvailability, reserve } = require("./controllers/booking-controller");
 const bookingStore = require("./models/booking-store");
 
@@ -140,6 +142,9 @@ async function sendEmail({ to, subject, html, text, replyTo, attachments }) {
   const transporter = nodemailer.createTransport({
     service: "gmail",
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    connectionTimeout: 8000,
+    greetingTimeout: 8000,
+    socketTimeout: 12000,
   });
   try {
     return await transporter.sendMail({
@@ -229,6 +234,35 @@ $('receiptBtn').onclick=()=>{const file=$('receipt').files[0];$('receiptError').
 function sendHtml(res, html) {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
   res.end(html);
+}
+async function savePaymentProof({ fileName, mimeType, buffer, guest }) {
+  const directory = path.resolve(process.env.PAYMENT_PROOF_DIR || path.join(process.cwd(), "data", "payment-proofs"));
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  const id = `${Date.now()}-${crypto.randomUUID()}`;
+  const storedName = `${id}-${fileName}`;
+  const proofPath = path.join(directory, storedName);
+  const recordPath = path.join(directory, `${id}.json`);
+  const record = {
+    id,
+    bookingReference: guest.bookingReference,
+    guestName: guest.name,
+    guestEmail: guest.email,
+    guestPhone: guest.phone,
+    staySummary: guest.staySummary,
+    originalFileName: fileName,
+    storedFileName: storedName,
+    mimeType,
+    uploadedAt: new Date().toISOString(),
+    notificationStatus: "queued",
+  };
+  try {
+    await fs.writeFile(proofPath, buffer, { flag: "wx", mode: 0o600 });
+    await fs.writeFile(recordPath, `${JSON.stringify(record, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+  } catch (error) {
+    await fs.unlink(proofPath).catch(() => {});
+    throw error;
+  }
+  return { id, recordPath, record };
 }
 async function api(req, res, pathname) {
   if (req.method !== "POST")
@@ -452,44 +486,51 @@ async function api(req, res, pathname) {
       return json(res, 400, { error: "The uploaded file does not match its selected image or PDF type." });
     if (!canSendBookingNotice("proof", req.socket.remoteAddress || "unknown", guest.email))
       return json(res, 429, { error: "Please wait before sending another notification." });
+    let saved;
+    try {
+      saved = await savePaymentProof({ fileName, mimeType, buffer: fileBuffer, guest: { ...guest, staySummary: clean(data.staySummary, 500) } });
+    } catch (error) {
+      console.error("Payment proof storage failed:", error.message);
+      return json(res, 503, { error: "The receipt could not be safely saved. Please try again or contact the resort." });
+    }
     const attachments = [{ filename: fileName, content: fileBuffer.toString("base64") }];
     const extraText = `\nPayment method: bank transfer\nPayment proof attached: ${fileName}`;
     const extraHtml = `<p><b>Payment method:</b> bank transfer</p><p><b>Payment proof:</b> attached (${escapeHtml(fileName)})</p>`;
     const title = "Bank transfer payment proof uploaded";
     const subject = `${title} — ${guest.bookingReference}`;
-    const text = `Cala Laiya ${title.toLowerCase()}\nGuest: ${guest.name}\nEmail: ${guest.email}\nPhone: ${guest.phone}\nRequest reference: ${guest.bookingReference}\nRequested stay: ${guest.staySummary}${extraText}`;
-    try {
-      await sendEmail({
-        to: PAYMENT_PROOF_RECIPIENT,
-        replyTo: guest.email,
-        subject,
-        text,
-        html: bookingHtml(title, guest, extraHtml),
-        attachments,
-      });
-      let guestEmailSent = true;
-      try {
-        await sendEmail({
+    const text = `Cala Laiya ${title.toLowerCase()}\nGuest: ${guest.name}\nEmail: ${guest.email}\nPhone: ${guest.phone}\nRequest reference: ${guest.bookingReference}\nRequested stay: ${clean(data.staySummary, 500)}${extraText}`;
+    const mail = async () => {
+      const outcomes = await Promise.allSettled([
+        sendEmail({
+          to: PAYMENT_PROOF_RECIPIENT,
+          replyTo: guest.email,
+          subject,
+          text,
+          html: bookingHtml(title, guest, extraHtml),
+          attachments,
+        }),
+        sendEmail({
           to: guest.email,
           subject: `Cala Laiya payment proof received — ${guest.bookingReference}`,
-          text: `Your payment proof has been received by Cala Laiya.\n\nRequest reference: ${guest.bookingReference}\nRequested stay: ${guest.staySummary}\nPayment method: bank transfer\nReceipt file: ${fileName}\n\nThe resort will verify the transfer and contact you regarding your reservation. This email is confirmation that the proof was received, not final payment or reservation confirmation.`,
-          html: bookingHtml("Payment proof received", guest, `<p>Your payment proof was received and forwarded for resort verification.</p>${extraHtml}<p><b>Status:</b> Awaiting resort verification</p><p>Please keep your original receipt until the resort confirms your stay.</p>`),
+          text: `Your payment proof has been received by Cala Laiya and saved for resort review.\n\nRequest reference: ${guest.bookingReference}\nRequested stay: ${clean(data.staySummary, 500)}\nPayment method: bank transfer\nReceipt file: ${fileName}\n\nThis confirms receipt of the uploaded proof only. It is not final payment or reservation confirmation.`,
+          html: bookingHtml("Payment proof received", guest, `<p>Your payment proof was saved for resort review.</p>${extraHtml}<p><b>Status:</b> Awaiting resort verification</p>`),
           attachments,
-        });
-      } catch (error) {
-        guestEmailSent = false;
-        console.error("Guest payment receipt email failed:", error.message);
-      }
-      return json(res, 200, {
-        ok: true,
-        guestEmailSent,
-        message: guestEmailSent
-          ? `Payment receipt sent to ${PAYMENT_PROOF_RECIPIENT} and a copy was emailed to ${guest.email}.`
-          : `Payment receipt sent to ${PAYMENT_PROOF_RECIPIENT}, but the guest copy could not be emailed.`,
+        }),
+      ]);
+      const status = outcomes[0].status === "fulfilled" ? "sent" : "failed";
+      await fs.writeFile(saved.recordPath, `${JSON.stringify({ ...saved.record, notificationStatus: status, notificationUpdatedAt: new Date().toISOString() }, null, 2)}\n`, { mode: 0o600 }).catch((error) => console.error("Could not update payment-proof notification status:", error.message));
+      outcomes.forEach((outcome, index) => {
+        if (outcome.status === "rejected") console.error(index === 0 ? "Resort payment-proof notification failed:" : "Guest payment-proof confirmation failed:", outcome.reason?.message || outcome.reason);
       });
-    } catch (error) {
-      return json(res, 500, { error: error.message || "Could not send the payment receipt email." });
-    }
+    };
+    setImmediate(() => { mail().catch((error) => console.error("Payment-proof notification task failed:", error.message)); });
+    return json(res, 200, {
+      ok: true,
+      stored: true,
+      bookingReference: guest.bookingReference,
+      notificationQueued: true,
+      message: "Payment proof uploaded and saved for resort review. Email notification is being attempted separately.",
+    });
   }
   return json(res, 404, { error: "Not found." });
 }

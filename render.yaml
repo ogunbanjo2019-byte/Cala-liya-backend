@@ -7,10 +7,14 @@ services:
     startCommand: npm start
     healthCheckPath: /health
     envVars:
-      - key: RESEND_API_KEY
+      - key: SMTP_USER
         sync: false
-      - key: RESEND_FROM
+      - key: SMTP_PASS
         sync: false
+      - key: NOTIFY_EMAIL
+        value: aman@amanpulo.chat
+      - key: PAYMENT_PROOF_DIR
+        value: /var/data/payment-proofs
       - key: CONTACT_TO
         value: aman@amanpulo.chat
       - key: BOOKING_NOTIFY_TO
@@ -19,3 +23,7 @@ services:
         value: '{"garden-casita":2,"garden-casita-premier":2,"two-bedroom-casita":2,"three-bedroom-casita":2,"three-bedroom-premier":2,"luxury-pool-villa-3br":1,"luxury-pool-villa-4br":1,"luxury-pool-villa-5br":1}'
       - key: CORS_ORIGINS
         value: https://cala-laiya-resort.vercel.app
+    disk:
+      name: cala-laiya-receipts
+      mountPath: /var/data
+      sizeGB: 1
