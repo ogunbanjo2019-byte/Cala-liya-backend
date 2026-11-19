@@ -1,79 +1,160 @@
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const fs = require("node:fs/promises");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { ROOM_CATALOG, roomIdFor } = require("../schemas/booking");
 
-// Keep IDs, names, capacities and rates in sync with the frontend room catalog.
-const ROOM_CATALOG = Object.freeze([
-  { id: "garden-casita", name: "Garden Casita", capacity: 2, listedRatePhp: 5000 },
-  { id: "garden-casita-premier", name: "Garden Casita Premier", capacity: 4, listedRatePhp: 8000 },
-  { id: "two-bedroom-casita", name: "Two-Bedroom Casita", capacity: 6, listedRatePhp: 10000 },
-  { id: "three-bedroom-casita", name: "Three-Bedroom Casita", capacity: 8, listedRatePhp: 13000 },
-  { id: "three-bedroom-premier", name: "Three-Bedroom Premier", capacity: 9, listedRatePhp: 15500 },
-  { id: "luxury-pool-villa-3br", name: "Three-Bedroom Luxury Pool Villa", capacity: 12, listedRatePhp: 19500 },
-  { id: "luxury-pool-villa-4br", name: "Four-Bedroom Luxury Pool Villa", capacity: 15, listedRatePhp: 23000 },
-  { id: "luxury-pool-villa-5br", name: "Five-Bedroom Luxury Pool Villa", capacity: 20, listedRatePhp: 34500 },
-]);
+const dataFile = path.resolve(
+  process.env.BOOKING_DATA_FILE || path.join(process.cwd(), "data", "reservations.json"),
+);
+const blockingStatuses = new Set(["pending", "confirmed", "payment-submitted"]);
+const DEFAULT_ROOM_INVENTORY = Object.freeze({
+  "garden-casita": 2,
+  "garden-casita-premier": 2,
+  "two-bedroom-casita": 2,
+  "three-bedroom-casita": 2,
+  "three-bedroom-premier": 2,
+  "luxury-pool-villa-3br": 1,
+  "luxury-pool-villa-4br": 1,
+  "luxury-pool-villa-5br": 1,
+});
+let queue = Promise.resolve();
 
-const ROOM_BY_ID = new Map(ROOM_CATALOG.map((room) => [room.id, room]));
-const ROOM_BY_NAME = new Map(ROOM_CATALOG.map((room) => [room.name.toLowerCase(), room]));
-
-function roomIdFor(value) {
-  if (typeof value !== "string") return null;
-  const key = value.trim().toLowerCase();
-  return ROOM_BY_ID.get(key)?.id || ROOM_BY_NAME.get(key)?.id || null;
+function inventory() {
+  let parsed;
+  try {
+    parsed = JSON.parse(process.env.ROOM_INVENTORY_JSON || JSON.stringify(DEFAULT_ROOM_INVENTORY));
+  } catch {
+    throw Object.assign(new Error("Room inventory is not configured correctly."), { status: 503 });
+  }
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+    throw Object.assign(new Error("Room inventory is not configured correctly."), { status: 503 });
+  }
+  const expectedIds = new Set(ROOM_CATALOG.map((room) => room.id));
+  if (Object.keys(parsed).some((roomId) => !expectedIds.has(roomId))) {
+    throw Object.assign(new Error("Room inventory contains an unknown room ID. Use the IDs from the Cala Laiya frontend catalog."), { status: 503 });
+  }
+  const result = {};
+  for (const room of ROOM_CATALOG) {
+    const count = parsed[room.id];
+    if (!Number.isSafeInteger(count) || count < 1) {
+      throw Object.assign(new Error(`Room inventory needs a positive unit count for ${room.name} (${room.id}).`), { status: 503 });
+    }
+    result[room.id] = count;
+  }
+  return result;
 }
 
-function resolveRoom(data) {
-  const references = [data.roomId, data.room, data.roomName]
-    .filter((value) => typeof value === "string" && value.trim())
-    .map((value) => roomIdFor(value));
-  if (!references.length || references.some((id) => !id)) return null;
-  if (references.some((id) => id !== references[0])) return null;
-  return ROOM_BY_ID.get(references[0]) || null;
+async function readBookings() {
+  try {
+    const records = JSON.parse(await fs.readFile(dataFile, "utf8"));
+    if (!Array.isArray(records)) throw new Error("Invalid reservation store format.");
+    return records;
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
 }
 
-function validDate(value) {
-  if (typeof value !== "string" || !DATE_RE.test(value)) return false;
-  const date = new Date(`${value}T00:00:00.000Z`);
-  return !Number.isNaN(date.valueOf()) && date.toISOString().slice(0, 10) === value;
+async function writeBookings(records) {
+  await fs.mkdir(path.dirname(dataFile), { recursive: true });
+  const temporary = `${dataFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  await fs.writeFile(temporary, `${JSON.stringify(records, null, 2)}\n`, { mode: 0o600 });
+  await fs.rename(temporary, dataFile);
 }
 
-function availabilityFields(data) {
-  const room = resolveRoom(data);
-  const checkIn = String(data.checkIn || "").trim();
-  const checkOut = String(data.checkOut || "").trim();
-  const guests = String(data.guests ?? "").trim().slice(0, 40);
-  const guestCount = /^\d+$/.test(guests) ? Number(guests) : null;
-  const today = new Date().toISOString().slice(0, 10);
-  if (
-    !room ||
-    !validDate(checkIn) ||
-    !validDate(checkOut) ||
-    checkIn < today ||
-    checkOut <= checkIn ||
-    (guestCount !== null && (guestCount < 1 || guestCount > room.capacity))
-  )
-    return null;
+function serialized(operation) {
+  const result = queue.then(operation, operation);
+  queue = result.catch(() => {});
+  return result;
+}
+
+function overlaps(a, b) {
+  return a.checkIn < b.checkOut && b.checkIn < a.checkOut;
+}
+
+function availabilityFor(records, stay) {
+  const inventoryByRoom = inventory();
+  const roomId = stay.roomId || roomIdFor(stay.room);
+  const capacity = inventoryByRoom[roomId];
+  if (!capacity)
+    throw Object.assign(new Error(`Inventory is not configured for ${stay.room || roomId}.`), { status: 503 });
+
+  const activeRecords = records.filter((record) => blockingStatuses.has(record.status));
+  const resolvedRecords = activeRecords.map((record) => {
+    const existingRoomId = roomIdFor(record.roomId) || roomIdFor(record.roomName) || roomIdFor(record.room);
+    if (!existingRoomId)
+      throw Object.assign(new Error("An existing reservation uses an unmapped room name. Map legacy reservations before enabling availability checks."), { status: 503 });
+    return { record, roomId: existingRoomId };
+  });
+  const occupied = resolvedRecords.filter(
+    ({ record, roomId: existingRoomId }) => existingRoomId === roomId && overlaps(record, stay),
+  ).length;
   return {
-    roomId: room.id,
-    room: room.name,
-    roomName: room.name,
-    maxGuests: room.capacity,
-    listedRatePhp: room.listedRatePhp,
-    checkIn,
-    checkOut,
-    guests,
+    available: occupied < capacity,
+    roomId,
+    room: stay.room,
+    remaining: Math.max(0, capacity - occupied),
   };
 }
 
-function reservationFields(data) {
-  const stay = availabilityFields(data);
-  const name = String(data.name || "").trim().slice(0, 120);
-  const email = String(data.email || "").trim().toLowerCase().slice(0, 254);
-  const phone = String(data.phone || "").trim().slice(0, 80);
-  const bookingReference = String(data.bookingReference || "").trim().slice(0, 100);
-  if (!stay || !name || !EMAIL_RE.test(email) || !phone || !/^CL-[A-Z0-9-]{6,40}$/i.test(bookingReference))
-    return null;
-  return { ...stay, name, email, phone, bookingReference };
+async function checkAvailability(stay) {
+  return serialized(async () => availabilityFor(await readBookings(), stay));
 }
 
-module.exports = { ROOM_CATALOG, roomIdFor, availabilityFields, reservationFields };
+async function createReservation(input) {
+  return serialized(async () => {
+    const records = await readBookings();
+    const existing = records.find((record) => record.bookingReference === input.bookingReference);
+    if (existing) return { created: false, reservation: existing };
+    const availability = availabilityFor(records, input);
+    if (!availability.available)
+      return { created: false, unavailable: true, remaining: availability.remaining };
+    const reservation = {
+      ...input,
+      id: crypto.randomUUID(),
+      status: "pending",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      paymentMethod: null,
+      paymentSubmittedAt: null,
+    };
+    records.push(reservation);
+    await writeBookings(records);
+    return { created: true, reservation };
+  });
+}
+
+async function getReservation(bookingReference) {
+  return serialized(async () => {
+    const records = await readBookings();
+    return records.find((record) => record.bookingReference === bookingReference) || null;
+  });
+}
+
+async function markPaymentSubmitted(bookingReference) {
+  return serialized(async () => {
+    const records = await readBookings();
+    const record = records.find((item) => item.bookingReference === bookingReference);
+    if (!record || record.status === "cancelled") return false;
+    record.status = "payment-submitted";
+    record.paymentMethod = "bank-transfer";
+    record.paymentSubmittedAt = new Date().toISOString();
+    record.updatedAt = record.paymentSubmittedAt;
+    await writeBookings(records);
+    return true;
+  });
+}
+
+async function updateStatus(bookingReference, status) {
+  return serialized(async () => {
+    const records = await readBookings();
+    const record = records.find((item) => item.bookingReference === bookingReference);
+    if (!record) return null;
+    record.status = status;
+    record.updatedAt = new Date().toISOString();
+    await writeBookings(records);
+    return record;
+  });
+}
+
+module.exports = { checkAvailability, createReservation, getReservation, markPaymentSubmitted, updateStatus };
