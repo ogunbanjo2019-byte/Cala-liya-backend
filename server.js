@@ -2,6 +2,7 @@ const http = require("node:http");
 const crypto = require("node:crypto");
 const fs = require("node:fs/promises");
 const path = require("node:path");
+require("dotenv").config({ path: path.join(__dirname, ".env") });
 const { checkAvailability, reserve } = require("./controllers/booking-controller");
 const bookingStore = require("./models/booking-store");
 
@@ -16,7 +17,7 @@ const MAX_BODY = 32 * 1024;
 const MAX_PROOF_BODY = 7 * 1024 * 1024;
 const MAX_PROOF_BYTES = 5 * 1024 * 1024;
 const MAX_MULTIPART_BODY = MAX_PROOF_BYTES + 128 * 1024;
-const PAYMENT_PROOF_RECIPIENT = process.env.NOTIFY_EMAIL || "aman@amanpulo.chat";
+const PAYMENT_PROOF_RECIPIENT = String(process.env.NOTIFY_EMAIL || "").trim();
 const ALLOWED_PROOF_TYPES = new Set([
   "image/jpeg",
   "image/png",
@@ -486,6 +487,10 @@ async function api(req, res, pathname) {
       return json(res, 400, { error: "The uploaded file does not match its selected image or PDF type." });
     if (!canSendBookingNotice("proof", req.socket.remoteAddress || "unknown", guest.email))
       return json(res, 429, { error: "Please wait before sending another notification." });
+    if (!PAYMENT_PROOF_RECIPIENT || !EMAIL_RE.test(PAYMENT_PROOF_RECIPIENT))
+      return json(res, 503, { error: "Payment notifications are not configured. Set a valid NOTIFY_EMAIL on the backend." });
+    if (!smtpReady())
+      return json(res, 503, { error: "Gmail SMTP is not configured yet. Please contact the site administrator." });
     let saved;
     try {
       saved = await savePaymentProof({ fileName, mimeType, buffer: fileBuffer, guest: { ...guest, staySummary: clean(data.staySummary, 500) } });
@@ -499,37 +504,44 @@ async function api(req, res, pathname) {
     const title = "Bank transfer payment proof uploaded";
     const subject = `${title} — ${guest.bookingReference}`;
     const text = `Cala Laiya ${title.toLowerCase()}\nGuest: ${guest.name}\nEmail: ${guest.email}\nPhone: ${guest.phone}\nRequest reference: ${guest.bookingReference}\nRequested stay: ${clean(data.staySummary, 500)}${extraText}`;
-    const mail = async () => {
-      const outcomes = await Promise.allSettled([
-        sendEmail({
-          to: PAYMENT_PROOF_RECIPIENT,
-          replyTo: guest.email,
-          subject,
-          text,
-          html: bookingHtml(title, guest, extraHtml),
-          attachments,
-        }),
-        sendEmail({
-          to: guest.email,
-          subject: `Cala Laiya payment proof received — ${guest.bookingReference}`,
-          text: `Your payment proof has been received by Cala Laiya and saved for resort review.\n\nRequest reference: ${guest.bookingReference}\nRequested stay: ${clean(data.staySummary, 500)}\nPayment method: bank transfer\nReceipt file: ${fileName}\n\nThis confirms receipt of the uploaded proof only. It is not final payment or reservation confirmation.`,
-          html: bookingHtml("Payment proof received", guest, `<p>Your payment proof was saved for resort review.</p>${extraHtml}<p><b>Status:</b> Awaiting resort verification</p>`),
-          attachments,
-        }),
-      ]);
-      const status = outcomes[0].status === "fulfilled" ? "sent" : "failed";
-      await fs.writeFile(saved.recordPath, `${JSON.stringify({ ...saved.record, notificationStatus: status, notificationUpdatedAt: new Date().toISOString() }, null, 2)}\n`, { mode: 0o600 }).catch((error) => console.error("Could not update payment-proof notification status:", error.message));
-      outcomes.forEach((outcome, index) => {
-        if (outcome.status === "rejected") console.error(index === 0 ? "Resort payment-proof notification failed:" : "Guest payment-proof confirmation failed:", outcome.reason?.message || outcome.reason);
-      });
-    };
-    setImmediate(() => { mail().catch((error) => console.error("Payment-proof notification task failed:", error.message)); });
+    const outcomes = await Promise.allSettled([
+      sendEmail({
+        to: PAYMENT_PROOF_RECIPIENT,
+        replyTo: guest.email,
+        subject,
+        text,
+        html: bookingHtml(title, guest, extraHtml),
+        attachments,
+      }),
+      sendEmail({
+        to: guest.email,
+        subject: `Cala Laiya payment proof received — ${guest.bookingReference}`,
+        text: `Your payment proof has been received by Cala Laiya and saved for resort review.\n\nRequest reference: ${guest.bookingReference}\nRequested stay: ${clean(data.staySummary, 500)}\nPayment method: bank transfer\nReceipt file: ${fileName}\n\nThis confirms receipt of the uploaded proof only. It is not final payment or reservation confirmation.`,
+        html: bookingHtml("Payment proof received", guest, `<p>Your payment proof was saved for resort review.</p>${extraHtml}<p><b>Status:</b> Awaiting resort verification</p>`),
+        attachments,
+      }),
+    ]);
+    const notificationSent = outcomes[0].status === "fulfilled";
+    const guestEmailSent = outcomes[1].status === "fulfilled";
+    const notificationStatus = notificationSent ? "sent" : "failed";
+    await fs.writeFile(
+      saved.recordPath,
+      `${JSON.stringify({ ...saved.record, notificationStatus, notificationUpdatedAt: new Date().toISOString() }, null, 2)}\n`,
+      { mode: 0o600 },
+    ).catch((error) => console.error("Could not update payment-proof notification status:", error.message));
+    outcomes.forEach((outcome, index) => {
+      if (outcome.status === "rejected")
+        console.error(index === 0 ? "Resort payment-proof notification failed:" : "Guest payment-proof confirmation failed:", outcome.reason?.message || outcome.reason);
+    });
     return json(res, 200, {
       ok: true,
       stored: true,
       bookingReference: guest.bookingReference,
-      notificationQueued: true,
-      message: "Payment proof uploaded and saved for resort review. Email notification is being attempted separately.",
+      notificationSent,
+      guestEmailSent,
+      message: notificationSent
+        ? "Payment proof uploaded, saved, and emailed to the resort for review."
+        : "Payment proof uploaded and saved, but the resort email notification could not be sent. Please contact the resort and provide your booking reference.",
     });
   }
   return json(res, 404, { error: "Not found." });
